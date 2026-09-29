@@ -1,0 +1,74 @@
+name: Update deployed ternssh
+
+on:
+  schedule:
+    - cron: '37 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ternssh-upstream-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.repository == 'vowers/ternssh'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Sync official release snapshot
+        id: sync
+        env:
+          FORCE_DEPLOY: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add release-upstream https://github.com/haradakashiwa/ternssh-cloudflare-workers-template.git
+          git fetch --no-tags release-upstream main
+          target=$(git rev-parse FETCH_HEAD)
+          version=$(git show "$target:VERSION")
+          changed=false
+          if ! git diff --quiet HEAD "$target" -- . ':(exclude).github'; then
+            # Official releases replace the template's history. Apply its product
+            # snapshot while preserving this fork's automation and commit history.
+            git restore --source="$target" --staged --worktree -- . ':(exclude).github'
+            changed=true
+          fi
+          git config user.name 'ternssh-updater[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          deploy=false
+          if [ "$changed" = true ]; then
+            git commit -m "chore: update ternssh to $version" -m "Upstream-template-commit: $target"
+            git push origin HEAD:main
+            deploy=true
+          elif [ "$FORCE_DEPLOY" = true ]; then
+            deploy=true
+          fi
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+          {
+            echo '### ternssh stable update'
+            echo "Version: $version"
+            echo "Upstream: $target"
+            echo "Fork main: $(git rev-parse HEAD)"
+            echo "Product files changed: $changed"
+            echo "Deployment requested: $deploy"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Trigger Cloudflare Workers Build
+        if: steps.sync.outputs.deploy == 'true'
+        env:
+          DEPLOY_HOOK_URL: ${{ secrets.TERNSSH_CLOUDFLARE_DEPLOY_HOOK_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_HOOK_URL" || { echo 'Missing deploy hook secret'; exit 1; }
+          response=$(curl --fail-with-body --silent --show-error --retry 2 -X POST "$DEPLOY_HOOK_URL")
+          printf '%s' "$response" | jq -e '.success == true' > /dev/null
+          build=$(printf '%s' "$response" | jq -r '.result.build_uuid // empty')
+          echo "Cloudflare build requested: $build" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Cloudflare performs build, D1 migration and deployment; check its build result.' >> "$GITHUB_STEP_SUMMARY"
